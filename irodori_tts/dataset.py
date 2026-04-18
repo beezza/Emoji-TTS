@@ -239,9 +239,9 @@ class _ManifestIndex:
 @dataclass
 class TTSCollator:
     tokenizer: PretrainedTextTokenizer
-    caption_tokenizer: PretrainedTextTokenizer | None
     latent_dim: int
     latent_patch_size: int
+    caption_tokenizer: PretrainedTextTokenizer | None = None
     fixed_target_latent_steps: int | None = None
     fixed_target_full_mask: bool = False
     max_text_len: int = 256

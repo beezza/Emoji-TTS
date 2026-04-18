@@ -7,6 +7,7 @@ dataset_tools.py
 機能1: slice_audio    -- 無音区間検出による長尺音声の自動スライス
 機能2: caption_audio  -- Whisperによる音声キャプション（文字起こし）+
                          JSONL/CSV manifest 出力
+                         (faster-whisper または transformers whisper を選択可能)
 機能3: emoji_caption  -- 既存CSVのtextと音声から音響特徴量を抽出し、
                          LLM（LM Studio / Groq / OpenAI / Together AI）で
                          Irodori-TTS互換の絵文字キャプションを生成する
@@ -21,7 +22,8 @@ dataset_tools.py
   python dataset_tools.py caption \
       --input  /path/to/sliced/ \
       --output-manifest /path/to/manifest.jsonl \
-      [--format jsonl|csv] [--model large-v3] [--language ja]
+      [--format jsonl|csv] [--model large-v3] [--language ja] \
+      [--whisper-backend faster-whisper|transformers]
 
   # スライス → キャプション を一括実行
   python dataset_tools.py pipeline \
@@ -38,6 +40,7 @@ dataset_tools.py
       [--lm-studio-model モデル名] \
       [--api-key YOUR_KEY]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -201,9 +204,11 @@ VOICE_ANALYSIS_CAPTION_RULES = """
 # ユーティリティ
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _require(pkg: str, pip_name: str | None = None) -> None:
     """ライブラリが存在しない場合にわかりやすいエラーを出す。"""
     import importlib
+
     if importlib.util.find_spec(pkg) is None:
         pip = pip_name or pkg
         print(f"[ERROR] '{pkg}' が見つかりません。\n  pip install {pip}", file=sys.stderr)
@@ -225,6 +230,7 @@ def _collect_audio_files(path: Path, recursive: bool) -> list[Path]:
 # ─────────────────────────────────────────────────────────────────────────────
 # 機能1: slice_audio  （Silero VAD ベース）
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _load_silero_vad(device, log_fn=print):
     """
@@ -265,21 +271,21 @@ def _load_silero_vad(device, log_fn=print):
     return model, get_speech_timestamps
 
 
-def _split_at_silence(wav_orig, wav_vad, start, end,
-                      max_samples, min_samples, scale):
+def _split_at_silence(wav_orig, wav_vad, start, end, max_samples, min_samples, scale):
     """
     max_sec を超えるセグメントを最近傍の低エネルギー点で再帰的に分割する。
     単純均等分割ではなく、VADスコアが最も低いフレームを優先して切る。
     """
     import torch
+
     segments: list[tuple[int, int]] = []
     cursor = start
 
     while (end - cursor) > max_samples:
         search_center = cursor + max_samples
-        search_half   = max(min_samples // 2, int(0.5 * (max_samples / max(scale, 1))))
-        search_start  = max(cursor + min_samples, search_center - search_half)
-        search_end    = min(end - min_samples,    search_center + search_half)
+        search_half = max(min_samples // 2, int(0.5 * (max_samples / max(scale, 1))))
+        search_start = max(cursor + min_samples, search_center - search_half)
+        search_end = min(end - min_samples, search_center + search_half)
 
         if search_start >= search_end:
             split_pt = cursor + max_samples
@@ -410,7 +416,7 @@ def slice_audio(
         segments: list[tuple[int, int]] = []
         for ts in speech_timestamps:
             start = max(0, int(ts["start"] * scale))
-            end   = min(wav.shape[-1], int(ts["end"] * scale))
+            end = min(wav.shape[-1], int(ts["end"] * scale))
             seg_len = end - start
             if seg_len < min_samples:
                 continue
@@ -419,8 +425,13 @@ def slice_audio(
             else:
                 segments.extend(
                     _split_at_silence(
-                        wav.squeeze(0), wav_vad_1d,
-                        start, end, max_samples, min_samples, scale,
+                        wav.squeeze(0),
+                        wav_vad_1d,
+                        start,
+                        end,
+                        max_samples,
+                        min_samples,
+                        scale,
                     )
                 )
 
@@ -448,6 +459,7 @@ def slice_audio(
 # 機能2: caption_audio
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def caption_audio(
     input_path: Path,
     output_manifest: Path,
@@ -457,11 +469,12 @@ def caption_audio(
     speaker_id: str | None = None,
     voice_design: bool = False,
     voice_design_caption: str | None = None,
-    output_format: str = "jsonl",   # "jsonl" | "csv"
+    output_format: str = "jsonl",  # "jsonl" | "csv"
     recursive: bool = False,
     batch_size: int = 1,
     device: str | None = None,
     model_cache_dir: Path | str | None = None,
+    whisper_backend: str = "faster-whisper",  # "faster-whisper" | "transformers"
     log_fn=print,
 ) -> list[dict]:
     """
@@ -491,12 +504,66 @@ def caption_audio(
     model_cache_dir : モデルのダウンロード・キャッシュ先ディレクトリ
                       None の場合は ~/.cache/huggingface/hub（HFデフォルト）
                       指定した場合はそのフォルダにモデルが保存される
+    whisper_backend : "faster-whisper" または "transformers"
+                      faster-whisper: より高速（推奨）
+                      transformers: 汎用的（CUDAドライバ不要な場合がある）
     log_fn          : ログ出力関数
 
     Returns
     -------
     書き出したレコードのリスト
     """
+    # バックエンド選択
+    if whisper_backend == "transformers":
+        return _caption_audio_with_transformers(
+            input_path,
+            output_manifest,
+            model_name=model_name,
+            language=language,
+            speaker_id=speaker_id,
+            voice_design=voice_design,
+            voice_design_caption=voice_design_caption,
+            output_format=output_format,
+            recursive=recursive,
+            device=device,
+            model_cache_dir=model_cache_dir,
+            log_fn=log_fn,
+        )
+    else:
+        return _caption_audio_with_faster_whisper(
+            input_path,
+            output_manifest,
+            model_name=model_name,
+            language=language,
+            speaker_id=speaker_id,
+            voice_design=voice_design,
+            voice_design_caption=voice_design_caption,
+            output_format=output_format,
+            recursive=recursive,
+            batch_size=batch_size,
+            device=device,
+            model_cache_dir=model_cache_dir,
+            log_fn=log_fn,
+        )
+
+
+def _caption_audio_with_faster_whisper(
+    input_path: Path,
+    output_manifest: Path,
+    *,
+    model_name: str = DEFAULT_WHISPER_MODEL,
+    language: str | None = "ja",
+    speaker_id: str | None = None,
+    voice_design: bool = False,
+    voice_design_caption: str | None = None,
+    output_format: str = "jsonl",
+    recursive: bool = False,
+    batch_size: int = 1,
+    device: str | None = None,
+    model_cache_dir: Path | str | None = None,
+    log_fn=print,
+) -> list[dict]:
+    """faster-whisperバックエンドを使用した文字起こし。"""
     _require("faster_whisper", "faster-whisper")
     from faster_whisper import WhisperModel
 
@@ -509,6 +576,7 @@ def caption_audio(
     if device is None:
         try:
             import torch
+
             device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             device = "cpu"
@@ -525,8 +593,9 @@ def caption_audio(
 
     log_fn(f"Whisperモデル読み込み: {model_name}  device={device}  compute={compute_type}")
     if download_root:
-        model = WhisperModel(model_name, device=device, compute_type=compute_type,
-                             download_root=download_root)
+        model = WhisperModel(
+            model_name, device=device, compute_type=compute_type, download_root=download_root
+        )
     else:
         model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
@@ -543,10 +612,10 @@ def caption_audio(
             segments, info = model.transcribe(
                 str(audio_path),
                 language=language,
-                beam_size=5,               # 精度重視
+                beam_size=5,  # 精度重視
                 best_of=5,
-                temperature=0.0,           # greedy decoding（精度最大）
-                vad_filter=True,           # VADフィルタで無音を除去
+                temperature=0.0,  # greedy decoding（精度最大）
+                vad_filter=True,  # VADフィルタで無音を除去
                 vad_parameters={"min_silence_duration_ms": 300},
             )
             text = "".join(seg.text for seg in segments).strip()
@@ -579,6 +648,184 @@ def caption_audio(
     return records
 
 
+def _caption_audio_with_transformers(
+    input_path: Path,
+    output_manifest: Path,
+    *,
+    model_name: str = DEFAULT_WHISPER_MODEL,
+    language: str | None = "ja",
+    speaker_id: str | None = None,
+    voice_design: bool = False,
+    voice_design_caption: str | None = None,
+    output_format: str = "jsonl",
+    recursive: bool = False,
+    device: str | None = None,
+    model_cache_dir: Path | str | None = None,
+    log_fn=print,
+) -> list[dict]:
+    """transformers Whisperバックエンドを使用した文字起こし。"""
+    _require("transformers", "transformers")
+    _require("torch", "torch")
+    _require("torchaudio", "torchaudio")
+
+    import torch
+    import torchaudio
+    from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+    audio_files = _collect_audio_files(input_path, recursive)
+    if not audio_files:
+        log_fn(f"[WARN] 音声ファイルが見つかりません: {input_path}")
+        return []
+
+    # デバイス自動選択
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # HuggingFace キャッシュディレクトリの設定
+    if model_cache_dir is not None:
+        cache_path = Path(model_cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        import os
+
+        os.environ["TRANSFORMERS_CACHE"] = str(cache_path)
+        log_fn(f"Whisperモデルキャッシュ: {cache_path}")
+
+    # モデル名の正規化（transformers用）
+    # "base" -> "openai/whisper-base", "large-v3" -> "openai/whisper-large-v3"
+    # カスタムモデル（例: "username/whisper-custom"）はそのまま使用
+
+    # 標準的なOpenAI Whisperモデルのショート名リスト
+    standard_whisper_models = {
+        "base",
+        "small",
+        "medium",
+        "large",
+        "base.en",
+        "small.en",
+        "medium.en",
+        "large-v2",
+        "large-v3",
+    }
+
+    if model_name in standard_whisper_models:
+        # 標準モデルの場合、プレフィックスを付ける
+        hf_model_name = f"openai/whisper-{model_name}"
+    else:
+        # カスタムモデルの場合、そのまま使用（ユーザーが完全なリポジトリIDを指定）
+        hf_model_name = model_name
+
+    log_fn(f"Whisperモデル読み込み: {hf_model_name}  device={device}")
+
+    # リポジトリID形式の事前検証
+    slash_count = hf_model_name.count("/")
+    if slash_count > 1:
+        error_msg = (
+            f"無効なモデルID形式です: '{hf_model_name}'\n"
+            f"HuggingFace HubのリポジトリIDは 'namespace/repo_name' の形式である必要があります。\n"
+            f"スラッシュは1つだけ使用可能です。現在は {slash_count} 個含まれています。\n\n"
+            f"正しい形式の例:\n"
+            f"  - openai/whisper-base (標準モデル)\n"
+            f"  - username/whisper-custom (カスタムモデル)\n"
+            f"  - org-name/whisper-ja (カスタム日本語モデル)"
+        )
+        log_fn(f"[ERROR] {error_msg}")
+        raise ValueError(error_msg)
+
+    try:
+        processor = WhisperProcessor.from_pretrained(hf_model_name)
+        model = WhisperForConditionalGeneration.from_pretrained(hf_model_name).to(device)
+        model.eval()
+    except ValueError:
+        # 既にバリデーションエラーが発生している場合は再発生
+        raise
+    except Exception as e:
+        # モデル読み込み失敗時の詳細エラーメッセージ
+        error_msg = str(e)
+        if "Repo id must be in the form" in error_msg:
+            log_fn(f"[ERROR] 無効なモデルID形式です: {hf_model_name}")
+            log_fn(f"[INFO] カスタムモデルの場合は 'namespace/repo_name' 形式で指定してください")
+            log_fn(f"[INFO] 例: 'openai/whisper-base', 'username/whisper-custom'")
+            log_fn(
+                f"[INFO] 標準Whisperモデル: base, small, medium, large, base.en, small.en, medium.en, large-v2, large-v3"
+            )
+        elif "404" in error_msg or "not found" in error_msg.lower():
+            log_fn(f"[ERROR] モデルが見つかりません: {hf_model_name}")
+            log_fn(f"[INFO] HuggingFace Hub上に存在するモデルIDか確認してください")
+            log_fn(f"[INFO] https://huggingface.co/models?search=whisper で検索できます")
+        else:
+            log_fn(f"[ERROR] モデルの読み込みに失敗しました: {error_msg}")
+        raise
+
+    if voice_design and speaker_id:
+        log_fn("[INFO] VoiceDesignモードのため speaker_id は無視します。")
+
+    output_manifest.parent.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+    total = len(audio_files)
+
+    for idx, audio_path in enumerate(audio_files, 1):
+        log_fn(f"[{idx}/{total}] キャプション: {audio_path.name}")
+        try:
+            # 音声ファイルを読み込み
+            waveform, sr = torchaudio.load(str(audio_path))
+
+            # 16kHzにリサンプリング（Whisperの要件）
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                waveform = resampler(waveform)
+
+            # ステレオの場合はモノラル化
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+            # 音声を処理
+            input_features = processor(
+                waveform.squeeze().numpy(), sampling_rate=16000, return_tensors="pt"
+            )["input_features"].to(device)
+
+            # 言語の設定
+            forced_decoder_ids = None
+            if language and language.lower() not in ("none", "auto", ""):
+                forced_decoder_ids = processor.get_decoder_prompt_ids(language=language)
+
+            # 文字起こし実行
+            with torch.no_grad():
+                predicted_ids = model.generate(
+                    input_features,
+                    forced_decoder_ids=forced_decoder_ids,
+                )
+
+            # テキスト抽出
+            text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+
+        except Exception as e:
+            log_fn(f"  [ERROR] 文字起こし失敗: {e}")
+            continue
+
+        if not text:
+            log_fn(f"  [SKIP] テキストが空: {audio_path.name}")
+            continue
+
+        record: dict = {"text": text, "audio_path": str(audio_path)}
+        if voice_design:
+            record["caption"] = voice_design_caption if voice_design_caption else text
+        elif speaker_id:
+            record["speaker"] = speaker_id
+
+        records.append(record)
+        log_fn(f"  → {text[:80]}{'...' if len(text) > 80 else ''}")
+
+    # ── 出力 ──
+    fmt = output_format.lower()
+    if fmt == "csv":
+        _write_csv(records, output_manifest, speaker_mode=not voice_design)
+    else:
+        _write_jsonl(records, output_manifest)
+
+    log_fn(f"\nキャプション完了: {len(records)}/{total} 件 → {output_manifest}")
+    return records
+
+
 def _write_jsonl(records: list[dict], path: Path) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for rec in records:
@@ -599,8 +846,7 @@ def _write_csv(records: list[dict], path: Path, *, speaker_mode: bool = False) -
         else:
             # speaker_mode=True または speaker値が1件でもある場合は speaker 列を出力
             has_speaker_value = any(
-                str(rec.get("speaker", rec.get("speaker_id", ""))).strip() != ""
-                for rec in records
+                str(rec.get("speaker", rec.get("speaker_id", ""))).strip() != "" for rec in records
             )
             if speaker_mode or has_speaker_value:
                 columns.append("speaker")
@@ -619,6 +865,7 @@ def _write_csv(records: list[dict], path: Path, *, speaker_mode: bool = False) -
 # ─────────────────────────────────────────────────────────────────────────────
 # 機能3: emoji_caption  音響特徴量抽出 + LLM 絵文字キャプション生成
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _extract_acoustic_features(wav_path: Path) -> dict:
     """
@@ -640,18 +887,21 @@ def _extract_acoustic_features(wav_path: Path) -> dict:
 
     # ── ピッチ ──
     f0, voiced_flag, _ = librosa.pyin(
-        y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
-        sr=sr, frame_length=2048,
+        y,
+        fmin=librosa.note_to_hz("C2"),
+        fmax=librosa.note_to_hz("C7"),
+        sr=sr,
+        frame_length=2048,
     )
     voiced_f0 = f0[voiced_flag] if voiced_flag is not None else f0
     voiced_f0 = voiced_f0[~np.isnan(voiced_f0)] if voiced_f0 is not None else np.array([])
     pitch_mean = float(np.mean(voiced_f0)) if len(voiced_f0) > 0 else 0.0
-    pitch_std  = float(np.std(voiced_f0))  if len(voiced_f0) > 0 else 0.0
+    pitch_std = float(np.std(voiced_f0)) if len(voiced_f0) > 0 else 0.0
 
     # ── RMSエネルギー ──
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
     energy_mean = float(np.mean(rms))
-    energy_std  = float(np.std(rms))
+    energy_std = float(np.std(rms))
 
     # ── 零交差率 ──
     zcr = librosa.feature.zero_crossing_rate(y, frame_length=2048, hop_length=512)[0]
@@ -698,8 +948,8 @@ def _call_llm_emoji(
         return text
 
     base_url = api_base_url or API_BASE_URLS.get(api_provider, "")
-    model    = model_name   or API_DEFAULT_MODELS.get(api_provider, "")
-    key      = api_key      or ("lm-studio" if api_provider == "lm_studio" else "")
+    model = model_name or API_DEFAULT_MODELS.get(api_provider, "")
+    key = api_key or ("lm-studio" if api_provider == "lm_studio" else "")
 
     client = OpenAI(api_key=key, base_url=base_url)
 
@@ -716,7 +966,7 @@ def _call_llm_emoji(
         "model": model,
         "messages": [
             {"role": "system", "content": EMOJI_ANNOTATIONS},
-            {"role": "user",   "content": user_message},
+            {"role": "user", "content": user_message},
         ],
         "temperature": 0.3,
         "max_tokens": 256,
@@ -725,7 +975,7 @@ def _call_llm_emoji(
     try:
         resp = client.chat.completions.create(**kwargs)
         caption = resp.choices[0].message.content.strip()
-        log_fn(f"  [LLM RAW] {repr(caption[:80])}")   # デバッグ: LLMの生返答を確認
+        log_fn(f"  [LLM RAW] {repr(caption[:80])}")  # デバッグ: LLMの生返答を確認
         # 空返答の場合は元テキストをフォールバック
         return caption if caption else text
     except Exception as e:
@@ -739,16 +989,16 @@ def _strip_emoji_characters(text: str) -> str:
         return ""
     emoji_re = re.compile(
         "["
-        "\U0001F300-\U0001F5FF"
-        "\U0001F600-\U0001F64F"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF"
-        "\U0001F800-\U0001F8FF"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FAFF"
-        "\U00002700-\U000027BF"
-        "\U000024C2-\U0001F251"
+        "\U0001f300-\U0001f5ff"
+        "\U0001f600-\U0001f64f"
+        "\U0001f680-\U0001f6ff"
+        "\U0001f700-\U0001f77f"
+        "\U0001f780-\U0001f7ff"
+        "\U0001f800-\U0001f8ff"
+        "\U0001f900-\U0001f9ff"
+        "\U0001fa00-\U0001faff"
+        "\U00002700-\U000027bf"
+        "\U000024c2-\U0001f251"
         "]",
         flags=re.UNICODE,
     )
@@ -875,8 +1125,8 @@ def emoji_caption(
     results: list[dict] = []
     for idx, rec in enumerate(records, 1):
         file_name = rec.get("file_name", "")
-        text      = rec.get("text", "").strip()
-        wav_path  = wav_dir / file_name
+        text = rec.get("text", "").strip()
+        wav_path = wav_dir / file_name
 
         log_fn(f"[{idx}/{total}] {file_name}")
 
@@ -884,9 +1134,11 @@ def emoji_caption(
         if wav_path.exists():
             try:
                 features = _extract_acoustic_features(wav_path)
-                log_fn(f"  音響: pitch={features['pitch_mean_hz']}Hz "
-                       f"energy={features['energy_mean']:.4f} "
-                       f"rate={features['speech_rate_syllables_per_sec']}/s")
+                log_fn(
+                    f"  音響: pitch={features['pitch_mean_hz']}Hz "
+                    f"energy={features['energy_mean']:.4f} "
+                    f"rate={features['speech_rate_syllables_per_sec']}/s"
+                )
             except Exception as e:
                 log_fn(f"  [WARN] 音響解析失敗: {e} → テキストのみでLLMに渡します")
                 features = {}
@@ -899,7 +1151,8 @@ def emoji_caption(
         emoji_text = text
         for attempt in range(retry_count + 1):
             emoji_text = _call_llm_emoji(
-                text, features,
+                text,
+                features,
                 api_provider=api_provider,
                 api_key=api_key,
                 api_base_url=api_base_url,
@@ -965,7 +1218,9 @@ def emoji_caption(
         writer.writeheader()
         writer.writerows(results)
 
-    mode_label = "絵文字＋音声分析キャプション" if voice_design else "絵文字キャプション（text列のみ）"
+    mode_label = (
+        "絵文字＋音声分析キャプション" if voice_design else "絵文字キャプション（text列のみ）"
+    )
     log_fn(f"\n{mode_label}完了: {len(results)}/{total} 件 → {csv_path}")
     return results
 
@@ -973,6 +1228,7 @@ def emoji_caption(
 # ─────────────────────────────────────────────────────────────────────────────
 # pipeline: slice → caption を一括実行
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def pipeline(
     input_path: Path,
@@ -988,11 +1244,12 @@ def pipeline(
     model_name: str = DEFAULT_WHISPER_MODEL,
     language: str | None = "ja",
     speaker_id: str | None = None,
+    output_format: str = "jsonl",
     voice_design: bool = False,
     voice_design_caption: str | None = None,
-    output_format: str = "jsonl",
     device: str | None = None,
     model_cache_dir: Path | str | None = None,
+    whisper_backend: str = "faster-whisper",
     log_fn=print,
 ) -> list[dict]:
     """スライス → キャプション を連続実行するパイプライン。"""
@@ -1000,12 +1257,17 @@ def pipeline(
     log_fn("STEP 1/2: 音声スライス")
     log_fn("=" * 60)
     sliced = slice_audio(
-        input_path, slice_output,
-        min_sec=min_sec, max_sec=max_sec,
-        threshold=threshold, min_silence_ms=min_silence_ms,
+        input_path,
+        slice_output,
+        min_sec=min_sec,
+        max_sec=max_sec,
+        threshold=threshold,
+        min_silence_ms=min_silence_ms,
         speech_pad_ms=speech_pad_ms,
-        target_sr=target_sr, recursive=False,
-        device=device, log_fn=log_fn,
+        target_sr=target_sr,
+        recursive=False,
+        device=device,
+        log_fn=log_fn,
     )
     if not sliced:
         log_fn("[WARN] スライス結果が0件のためキャプションをスキップします。")
@@ -1015,11 +1277,18 @@ def pipeline(
     log_fn("STEP 2/2: キャプション生成")
     log_fn("=" * 60)
     records = caption_audio(
-        slice_output, output_manifest,
-        model_name=model_name, language=language, speaker_id=speaker_id,
-        voice_design=voice_design, voice_design_caption=voice_design_caption,
-        output_format=output_format, recursive=False, device=device,
-        model_cache_dir=model_cache_dir, log_fn=log_fn,
+        slice_output,
+        output_manifest,
+        model_name=model_name,
+        language=language,
+        speaker_id=speaker_id,
+        voice_design=voice_design,
+        voice_design_caption=voice_design_caption,
+        output_format=output_format,
+        recursive=False,
+        device=device,
+        model_cache_dir=model_cache_dir,
+        log_fn=log_fn,
     )
     return records
 
@@ -1028,49 +1297,89 @@ def pipeline(
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _add_slice_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--input",  required=True, help="入力ファイルまたはフォルダ")
+    p.add_argument("--input", required=True, help="入力ファイルまたはフォルダ")
     p.add_argument("--output", required=True, help="スライス済みWAVの保存先フォルダ")
-    p.add_argument("--min-sec",        type=float, default=2.0,  help="最小セグメント長（秒）[default: 2.0]")
-    p.add_argument("--max-sec",        type=float, default=30.0, help="最大セグメント長（秒）[default: 30.0]")
-    p.add_argument("--threshold",      type=float, default=0.5,  help="VAD発話判定閾値 0.0〜1.0 [default: 0.5]")
-    p.add_argument("--min-silence-ms", type=int,   default=300,  help="無音と判定する最短時間ms [default: 300]")
-    p.add_argument("--speech-pad-ms",  type=int,   default=30,   help="発話前後のパディングms [default: 30]")
-    p.add_argument("--target-sr",      type=int,   default=None, help="出力リサンプルSR（省略=元のまま）")
-    p.add_argument("--device",                     default=None, help="cuda / cpu（省略=自動）")
+    p.add_argument(
+        "--min-sec", type=float, default=2.0, help="最小セグメント長（秒）[default: 2.0]"
+    )
+    p.add_argument(
+        "--max-sec", type=float, default=30.0, help="最大セグメント長（秒）[default: 30.0]"
+    )
+    p.add_argument(
+        "--threshold", type=float, default=0.5, help="VAD発話判定閾値 0.0〜1.0 [default: 0.5]"
+    )
+    p.add_argument(
+        "--min-silence-ms", type=int, default=300, help="無音と判定する最短時間ms [default: 300]"
+    )
+    p.add_argument(
+        "--speech-pad-ms", type=int, default=30, help="発話前後のパディングms [default: 30]"
+    )
+    p.add_argument("--target-sr", type=int, default=None, help="出力リサンプルSR（省略=元のまま）")
+    p.add_argument("--device", default=None, help="cuda / cpu（省略=自動）")
     p.add_argument("--recursive", action="store_true", help="フォルダを再帰検索")
 
 
 def _add_caption_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--input", required=True, help="入力ファイルまたはフォルダ")
     p.add_argument("--output-manifest", required=True, help="出力manidestファイルパス")
-    p.add_argument("--format", dest="output_format", choices=["jsonl", "csv"], default="jsonl",
-                   help="出力フォーマット [default: jsonl]")
-    p.add_argument("--model", default=DEFAULT_WHISPER_MODEL,
-                   help=f"Whisperモデル名 [default: {DEFAULT_WHISPER_MODEL}]")
+    p.add_argument(
+        "--format",
+        dest="output_format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="出力フォーマット [default: jsonl]",
+    )
+    p.add_argument(
+        "--model",
+        default=DEFAULT_WHISPER_MODEL,
+        help=f"Whisperモデル名 [default: {DEFAULT_WHISPER_MODEL}]",
+    )
     p.add_argument("--language", default="ja", help="言語コード（ja/en/None=自動）[default: ja]")
     p.add_argument("--speaker-id", default=None, help="全ファイルに付与する話者ID（省略可）")
-    p.add_argument("--voice-design", action="store_true",
-                   help="VoiceDesignモード（speaker_idは使わずcaption列を出力）")
-    p.add_argument("--voice-design-caption", default=None,
-                   help="VoiceDesignモード時に全ファイルへ付与するcaption（省略時はWhisper text）")
+    p.add_argument(
+        "--voice-design",
+        action="store_true",
+        help="VoiceDesignモード（speaker_idは使わずcaption列を出力）",
+    )
+    p.add_argument(
+        "--voice-design-caption",
+        default=None,
+        help="VoiceDesignモード時に全ファイルへ付与するcaption（省略時はWhisper text）",
+    )
     p.add_argument("--device", default=None, help="cuda / cpu（省略=自動）")
-    p.add_argument("--model-cache-dir", default=None,
-                   help="Whisperモデルのキャッシュ先ディレクトリ（省略=~/.cache/huggingface/hub）")
+    p.add_argument(
+        "--model-cache-dir",
+        default=None,
+        help="Whisperモデルのキャッシュ先ディレクトリ（省略=~/.cache/huggingface/hub）",
+    )
+    p.add_argument(
+        "--whisper-backend",
+        choices=["faster-whisper", "transformers"],
+        default="faster-whisper",
+        help="Whisper実装の選択: faster-whisper(高速)またはtransformers(汎用)",
+    )
     p.add_argument("--recursive", action="store_true", help="フォルダを再帰検索")
 
 
 def _add_emoji_caption_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--csv",     required=True, help="入力CSVファイルパス（file_name,text）")
+    p.add_argument("--csv", required=True, help="入力CSVファイルパス（file_name,text）")
     p.add_argument("--wav-dir", required=True, help="wavファイルが格納されているフォルダ")
-    p.add_argument("--api",     default="lm_studio",
-                   choices=["none", "lm_studio", "groq", "openai", "together"],
-                   help="使用するAPIプロバイダー [default: lm_studio]")
-    p.add_argument("--api-key",      default="", help="外部APIキー（LM Studioは不要）")
+    p.add_argument(
+        "--api",
+        default="lm_studio",
+        choices=["none", "lm_studio", "groq", "openai", "together"],
+        help="使用するAPIプロバイダー [default: lm_studio]",
+    )
+    p.add_argument("--api-key", default="", help="外部APIキー（LM Studioは不要）")
     p.add_argument("--api-base-url", default="", help="APIベースURL（省略=自動）")
-    p.add_argument("--model",        default="", help="モデル名（省略=デフォルト）")
-    p.add_argument("--voice-design", action="store_true",
-                   help="VoiceDesignモード: caption列（音声分析）を生成する。省略時はtext列（絵文字）のみ")
+    p.add_argument("--model", default="", help="モデル名（省略=デフォルト）")
+    p.add_argument(
+        "--voice-design",
+        action="store_true",
+        help="VoiceDesignモード: caption列（音声分析）を生成する。省略時はtext列（絵文字）のみ",
+    )
 
 
 def main() -> None:
@@ -1092,23 +1401,29 @@ def main() -> None:
 
     # ── pipeline サブコマンド ──
     p_pipe = sub.add_parser("pipeline", help="スライス → キャプションを一括実行")
-    p_pipe.add_argument("--input",           required=True)
-    p_pipe.add_argument("--slice-output",    required=True)
+    p_pipe.add_argument("--input", required=True)
+    p_pipe.add_argument("--slice-output", required=True)
     p_pipe.add_argument("--output-manifest", required=True)
     p_pipe.add_argument("--format", dest="output_format", choices=["jsonl", "csv"], default="jsonl")
-    p_pipe.add_argument("--min-sec",        type=float, default=2.0)
-    p_pipe.add_argument("--max-sec",        type=float, default=30.0)
-    p_pipe.add_argument("--threshold",      type=float, default=0.5)
-    p_pipe.add_argument("--min-silence-ms", type=int,   default=300)
-    p_pipe.add_argument("--speech-pad-ms",  type=int,   default=30)
-    p_pipe.add_argument("--target-sr",      type=int,   default=None)
-    p_pipe.add_argument("--model",          default=DEFAULT_WHISPER_MODEL)
-    p_pipe.add_argument("--language",       default="ja")
-    p_pipe.add_argument("--speaker-id",     default=None)
+    p_pipe.add_argument("--min-sec", type=float, default=2.0)
+    p_pipe.add_argument("--max-sec", type=float, default=30.0)
+    p_pipe.add_argument("--threshold", type=float, default=0.5)
+    p_pipe.add_argument("--min-silence-ms", type=int, default=300)
+    p_pipe.add_argument("--speech-pad-ms", type=int, default=30)
+    p_pipe.add_argument("--target-sr", type=int, default=None)
+    p_pipe.add_argument("--model", default=DEFAULT_WHISPER_MODEL)
+    p_pipe.add_argument("--language", default="ja")
+    p_pipe.add_argument("--speaker-id", default=None)
     p_pipe.add_argument("--voice-design", action="store_true")
     p_pipe.add_argument("--voice-design-caption", default=None)
-    p_pipe.add_argument("--device",         default=None)
+    p_pipe.add_argument("--device", default=None)
     p_pipe.add_argument("--model-cache-dir", default=None)
+    p_pipe.add_argument(
+        "--whisper-backend",
+        choices=["faster-whisper", "transformers"],
+        default="faster-whisper",
+        help="Whisper実装の選択: faster-whisper(高速)またはtransformers(汎用)",
+    )
 
     # ── emoji_caption サブコマンド ──
     p_emoji = sub.add_parser("emoji_caption", help="CSVから絵文字キャプションを生成")
@@ -1123,44 +1438,62 @@ def main() -> None:
 
     if args.command == "slice":
         slice_audio(
-            Path(args.input), Path(args.output),
-            min_sec=args.min_sec, max_sec=args.max_sec,
-            threshold=args.threshold, min_silence_ms=args.min_silence_ms,
+            Path(args.input),
+            Path(args.output),
+            min_sec=args.min_sec,
+            max_sec=args.max_sec,
+            threshold=args.threshold,
+            min_silence_ms=args.min_silence_ms,
             speech_pad_ms=args.speech_pad_ms,
-            target_sr=args.target_sr, recursive=args.recursive,
+            target_sr=args.target_sr,
+            recursive=args.recursive,
             device=args.device,
         )
 
     elif args.command == "caption":
         lang = None if args.language.lower() in ("none", "auto", "") else args.language
         caption_audio(
-            Path(args.input), Path(args.output_manifest),
-            model_name=args.model, language=lang,
-            speaker_id=args.speaker_id, output_format=args.output_format,
+            Path(args.input),
+            Path(args.output_manifest),
+            model_name=args.model,
+            language=lang,
+            speaker_id=args.speaker_id,
+            output_format=args.output_format,
             voice_design=args.voice_design,
             voice_design_caption=args.voice_design_caption,
-            recursive=args.recursive, device=args.device,
+            recursive=args.recursive,
+            device=args.device,
             model_cache_dir=args.model_cache_dir,
+            whisper_backend=getattr(args, "whisper_backend", "faster-whisper"),
         )
 
     elif args.command == "pipeline":
         lang = None if args.language.lower() in ("none", "auto", "") else args.language
         pipeline(
-            Path(args.input), Path(args.slice_output), Path(args.output_manifest),
-            min_sec=args.min_sec, max_sec=args.max_sec,
-            threshold=args.threshold, min_silence_ms=args.min_silence_ms,
+            Path(args.input),
+            Path(args.slice_output),
+            Path(args.output_manifest),
+            min_sec=args.min_sec,
+            max_sec=args.max_sec,
+            threshold=args.threshold,
+            min_silence_ms=args.min_silence_ms,
             speech_pad_ms=args.speech_pad_ms,
             target_sr=args.target_sr,
-            model_name=args.model, language=lang,
-            speaker_id=args.speaker_id, output_format=args.output_format,
+            model_name=args.model,
+            language=lang,
+            speaker_id=args.speaker_id,
+            output_format=args.output_format,
             voice_design=args.voice_design,
             voice_design_caption=args.voice_design_caption,
-            device=args.device, model_cache_dir=args.model_cache_dir,
+            device=args.device,
+            model_cache_dir=args.model_cache_dir,
+            whisper_backend=args.whisper_backend,
         )
 
     elif args.command == "emoji_caption":
         emoji_caption(
-            Path(args.csv), Path(args.wav_dir),
+            Path(args.csv),
+            Path(args.wav_dir),
             api_provider=args.api,
             api_key=args.api_key,
             api_base_url=args.api_base_url,
@@ -1173,10 +1506,11 @@ def main() -> None:
 # GUI  (tkinter)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _launch_gui() -> None:
     """tkinter GUIを起動する。"""
     import tkinter as tk
-    from tkinter import ttk, filedialog, scrolledtext
+    from tkinter import filedialog, scrolledtext, ttk
 
     root = tk.Tk()
     root.title("Dataset Tools")
@@ -1187,15 +1521,16 @@ def _launch_gui() -> None:
 
     # ── 共通ログウィジェット生成ヘルパー ──
     def _make_log(frame):
-        log = scrolledtext.ScrolledText(frame, height=10, state="disabled",
-                                        font=("Consolas", 9))
+        log = scrolledtext.ScrolledText(frame, height=10, state="disabled", font=("Consolas", 9))
         log.pack(fill="both", expand=True, padx=5, pady=5)
+
         def write(msg):
             log.config(state="normal")
             log.insert("end", msg + "\n")
             log.see("end")
             log.config(state="disabled")
             root.update_idletasks()
+
         return write
 
     def _browse_file(var, filetypes=None):
@@ -1214,8 +1549,7 @@ def _launch_gui() -> None:
             var.set(path)
 
     def _row(frame, label, widget, row):
-        tk.Label(frame, text=label, anchor="w").grid(
-            row=row, column=0, sticky="w", padx=5, pady=3)
+        tk.Label(frame, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=5, pady=3)
         widget.grid(row=row, column=1, sticky="ew", padx=5, pady=3)
         frame.columnconfigure(1, weight=1)
 
@@ -1228,52 +1562,71 @@ def _launch_gui() -> None:
     sf = ttk.LabelFrame(tab_slice, text="設定", padding=8)
     sf.pack(fill="x", padx=10, pady=5)
 
-    s_input   = tk.StringVar()
-    s_output  = tk.StringVar()
+    s_input = tk.StringVar()
+    s_output = tk.StringVar()
     s_min_sec = tk.StringVar(value="2.0")
     s_max_sec = tk.StringVar(value="30.0")
-    s_thresh  = tk.StringVar(value="0.5")
+    s_thresh = tk.StringVar(value="0.5")
     s_silence = tk.StringVar(value="300")
-    s_pad     = tk.StringVar(value="30")
-    s_device  = tk.StringVar(value="")
+    s_pad = tk.StringVar(value="30")
+    s_device = tk.StringVar(value="")
 
-    for i, (lbl, var, btn) in enumerate([
-        ("入力ファイル/フォルダ", s_input,  lambda: _browse_file(s_input) or _browse_dir(s_input)),
-        ("出力フォルダ",         s_output, lambda: _browse_dir(s_output)),
-    ]):
+    for i, (lbl, var, btn) in enumerate(
+        [
+            (
+                "入力ファイル/フォルダ",
+                s_input,
+                lambda: _browse_file(s_input) or _browse_dir(s_input),
+            ),
+            ("出力フォルダ", s_output, lambda: _browse_dir(s_output)),
+        ]
+    ):
         e = tk.Entry(sf, textvariable=var, width=50)
         b = tk.Button(sf, text="参照", command=btn)
         _row(sf, lbl, e, i)
         b.grid(row=i, column=2, padx=5)
 
-    for i, (lbl, var) in enumerate([
-        ("最小秒数",     s_min_sec),
-        ("最大秒数",     s_max_sec),
-        ("VAD閾値",      s_thresh),
-        ("最小無音ms",   s_silence),
-        ("パディングms", s_pad),
-        ("デバイス(cuda/cpu/空=自動)", s_device),
-    ], start=2):
+    for i, (lbl, var) in enumerate(
+        [
+            ("最小秒数", s_min_sec),
+            ("最大秒数", s_max_sec),
+            ("VAD閾値", s_thresh),
+            ("最小無音ms", s_silence),
+            ("パディングms", s_pad),
+            ("デバイス(cuda/cpu/空=自動)", s_device),
+        ],
+        start=2,
+    ):
         _row(sf, lbl, tk.Entry(sf, textvariable=var, width=20), i)
 
     s_log = _make_log(tab_slice)
 
     def _run_slice():
         import threading
+
         def task():
             slice_audio(
-                Path(s_input.get()), Path(s_output.get()),
-                min_sec=float(s_min_sec.get()), max_sec=float(s_max_sec.get()),
+                Path(s_input.get()),
+                Path(s_output.get()),
+                min_sec=float(s_min_sec.get()),
+                max_sec=float(s_max_sec.get()),
                 threshold=float(s_thresh.get()),
                 min_silence_ms=int(s_silence.get()),
                 speech_pad_ms=int(s_pad.get()),
                 device=s_device.get() or None,
                 log_fn=s_log,
             )
+
         threading.Thread(target=task, daemon=True).start()
 
-    tk.Button(tab_slice, text="▶ スライス実行", command=_run_slice,
-              bg="#4CAF50", fg="white", font=("", 11, "bold")).pack(pady=5)
+    tk.Button(
+        tab_slice,
+        text="▶ スライス実行",
+        command=_run_slice,
+        bg="#4CAF50",
+        fg="white",
+        font=("", 11, "bold"),
+    ).pack(pady=5)
 
     # ══════════════════════════════════════════════════════
     # タブ2: キャプション (Whisper)
@@ -1284,50 +1637,89 @@ def _launch_gui() -> None:
     cf = ttk.LabelFrame(tab_cap, text="設定", padding=8)
     cf.pack(fill="x", padx=10, pady=5)
 
-    c_input   = tk.StringVar()
-    c_output  = tk.StringVar()
-    c_model   = tk.StringVar(value=DEFAULT_WHISPER_MODEL)
-    c_lang    = tk.StringVar(value="ja")
+    c_input = tk.StringVar()
+    c_output = tk.StringVar()
+    c_model = tk.StringVar(value=DEFAULT_WHISPER_MODEL)
+    c_lang = tk.StringVar(value="ja")
     c_speaker = tk.StringVar(value="")
-    c_format  = tk.StringVar(value="csv")
-    c_device  = tk.StringVar(value="")
+    c_format = tk.StringVar(value="csv")
+    c_device = tk.StringVar(value="")
+    c_backend = tk.StringVar(value="faster-whisper")
 
-    for i, (lbl, var, is_save) in enumerate([
-        ("入力フォルダ/ファイル", c_input,  False),
-        ("出力manifestパス",     c_output, True),
-    ]):
+    for i, (lbl, var, is_save) in enumerate(
+        [
+            ("入力フォルダ/ファイル", c_input, False),
+            ("出力manifestパス", c_output, True),
+        ]
+    ):
         e = tk.Entry(cf, textvariable=var, width=50)
-        cmd = (lambda v=var: _browse_save(v, [("CSV","*.csv"),("JSONL","*.jsonl"),("All","*.*")])) \
-              if is_save else (lambda v=var: _browse_dir(v))
+        cmd = (
+            (
+                lambda v=var: _browse_save(
+                    v, [("CSV", "*.csv"), ("JSONL", "*.jsonl"), ("All", "*.*")]
+                )
+            )
+            if is_save
+            else (lambda v=var: _browse_dir(v))
+        )
         b = tk.Button(cf, text="参照", command=cmd)
         _row(cf, lbl, e, i)
         b.grid(row=i, column=2, padx=5)
 
     _row(cf, "Whisperモデル", tk.Entry(cf, textvariable=c_model, width=20), 2)
-    _row(cf, "言語コード",    tk.Entry(cf, textvariable=c_lang,  width=10), 3)
+    _row(cf, "言語コード", tk.Entry(cf, textvariable=c_lang, width=10), 3)
     _row(cf, "話者ID(省略可)", tk.Entry(cf, textvariable=c_speaker, width=20), 4)
-    _row(cf, "出力形式", ttk.Combobox(cf, textvariable=c_format,
-         values=["csv","jsonl"], width=10, state="readonly"), 5)
-    _row(cf, "デバイス(cuda/cpu/空=自動)", tk.Entry(cf, textvariable=c_device, width=15), 6)
+    _row(
+        cf,
+        "出力形式",
+        ttk.Combobox(
+            cf, textvariable=c_format, values=["csv", "jsonl"], width=10, state="readonly"
+        ),
+        5,
+    )
+    _row(
+        cf,
+        "Whisperバックエンド",
+        ttk.Combobox(
+            cf,
+            textvariable=c_backend,
+            values=["faster-whisper", "transformers"],
+            width=20,
+            state="readonly",
+        ),
+        6,
+    )
+    _row(cf, "デバイス(cuda/cpu/空=自動)", tk.Entry(cf, textvariable=c_device, width=15), 7)
 
     c_log = _make_log(tab_cap)
 
     def _run_caption():
         import threading
+
         def task():
-            lang = None if c_lang.get().lower() in ("none","auto","") else c_lang.get()
+            lang = None if c_lang.get().lower() in ("none", "auto", "") else c_lang.get()
             caption_audio(
-                Path(c_input.get()), Path(c_output.get()),
-                model_name=c_model.get(), language=lang,
+                Path(c_input.get()),
+                Path(c_output.get()),
+                model_name=c_model.get(),
+                language=lang,
                 speaker_id=c_speaker.get() or None,
                 output_format=c_format.get(),
                 device=c_device.get() or None,
+                whisper_backend=c_backend.get(),
                 log_fn=c_log,
             )
+
         threading.Thread(target=task, daemon=True).start()
 
-    tk.Button(tab_cap, text="▶ キャプション実行", command=_run_caption,
-              bg="#2196F3", fg="white", font=("", 11, "bold")).pack(pady=5)
+    tk.Button(
+        tab_cap,
+        text="▶ キャプション実行",
+        command=_run_caption,
+        bg="#2196F3",
+        fg="white",
+        font=("", 11, "bold"),
+    ).pack(pady=5)
 
     # ══════════════════════════════════════════════════════
     # タブ3: パイプライン
@@ -1338,45 +1730,68 @@ def _launch_gui() -> None:
     pf = ttk.LabelFrame(tab_pipe, text="設定", padding=8)
     pf.pack(fill="x", padx=10, pady=5)
 
-    p_input    = tk.StringVar()
+    p_input = tk.StringVar()
     p_sliceout = tk.StringVar()
     p_manifest = tk.StringVar()
-    p_model    = tk.StringVar(value=DEFAULT_WHISPER_MODEL)
-    p_lang     = tk.StringVar(value="ja")
-    p_format   = tk.StringVar(value="csv")
+    p_model = tk.StringVar(value=DEFAULT_WHISPER_MODEL)
+    p_lang = tk.StringVar(value="ja")
+    p_format = tk.StringVar(value="csv")
 
-    for i, (lbl, var, is_save) in enumerate([
-        ("入力音声ファイル",    p_input,    False),
-        ("スライス出力フォルダ", p_sliceout, False),
-        ("manifest出力パス",   p_manifest, True),
-    ]):
+    for i, (lbl, var, is_save) in enumerate(
+        [
+            ("入力音声ファイル", p_input, False),
+            ("スライス出力フォルダ", p_sliceout, False),
+            ("manifest出力パス", p_manifest, True),
+        ]
+    ):
         e = tk.Entry(pf, textvariable=var, width=50)
-        cmd = (lambda v=var: _browse_save(v, [("CSV","*.csv"),("JSONL","*.jsonl")])) \
-              if is_save else (lambda v=var: _browse_file(v) if i == 0 else _browse_dir(v))
+        cmd = (
+            (lambda v=var: _browse_save(v, [("CSV", "*.csv"), ("JSONL", "*.jsonl")]))
+            if is_save
+            else (lambda v=var: _browse_file(v) if i == 0 else _browse_dir(v))
+        )
         b = tk.Button(pf, text="参照", command=cmd)
         _row(pf, lbl, e, i)
         b.grid(row=i, column=2, padx=5)
 
     _row(pf, "Whisperモデル", tk.Entry(pf, textvariable=p_model, width=20), 3)
-    _row(pf, "言語コード",    tk.Entry(pf, textvariable=p_lang,  width=10), 4)
-    _row(pf, "出力形式", ttk.Combobox(pf, textvariable=p_format,
-         values=["csv","jsonl"], width=10, state="readonly"), 5)
+    _row(pf, "言語コード", tk.Entry(pf, textvariable=p_lang, width=10), 4)
+    _row(
+        pf,
+        "出力形式",
+        ttk.Combobox(
+            pf, textvariable=p_format, values=["csv", "jsonl"], width=10, state="readonly"
+        ),
+        5,
+    )
 
     p_log = _make_log(tab_pipe)
 
     def _run_pipeline():
         import threading
+
         def task():
-            lang = None if p_lang.get().lower() in ("none","auto","") else p_lang.get()
+            lang = None if p_lang.get().lower() in ("none", "auto", "") else p_lang.get()
             pipeline(
-                Path(p_input.get()), Path(p_sliceout.get()), Path(p_manifest.get()),
-                model_name=p_model.get(), language=lang,
-                output_format=p_format.get(), log_fn=p_log,
+                Path(p_input.get()),
+                Path(p_sliceout.get()),
+                Path(p_manifest.get()),
+                model_name=p_model.get(),
+                language=lang,
+                output_format=p_format.get(),
+                log_fn=p_log,
             )
+
         threading.Thread(target=task, daemon=True).start()
 
-    tk.Button(tab_pipe, text="▶ パイプライン実行", command=_run_pipeline,
-              bg="#9C27B0", fg="white", font=("", 11, "bold")).pack(pady=5)
+    tk.Button(
+        tab_pipe,
+        text="▶ パイプライン実行",
+        command=_run_pipeline,
+        bg="#9C27B0",
+        fg="white",
+        font=("", 11, "bold"),
+    ).pack(pady=5)
 
     # ══════════════════════════════════════════════════════
     # タブ4: 絵文字キャプション (新機能)
@@ -1387,16 +1802,21 @@ def _launch_gui() -> None:
     ef = ttk.LabelFrame(tab_emoji, text="ファイル設定", padding=8)
     ef.pack(fill="x", padx=10, pady=5)
 
-    e_csv     = tk.StringVar()
-    e_wavdir  = tk.StringVar()
+    e_csv = tk.StringVar()
+    e_wavdir = tk.StringVar()
 
-    for i, (lbl, var, is_file) in enumerate([
-        ("入力CSV（file_name,text）", e_csv,    True),
-        ("wavファイルフォルダ",        e_wavdir, False),
-    ]):
+    for i, (lbl, var, is_file) in enumerate(
+        [
+            ("入力CSV（file_name,text）", e_csv, True),
+            ("wavファイルフォルダ", e_wavdir, False),
+        ]
+    ):
         ent = tk.Entry(ef, textvariable=var, width=50)
-        cmd = (lambda v=var: _browse_file(v, [("CSV","*.csv"),("All","*.*")])) \
-              if is_file else (lambda v=var: _browse_dir(v))
+        cmd = (
+            (lambda v=var: _browse_file(v, [("CSV", "*.csv"), ("All", "*.*")]))
+            if is_file
+            else (lambda v=var: _browse_dir(v))
+        )
         b = tk.Button(ef, text="参照", command=cmd)
         _row(ef, lbl, ent, i)
         b.grid(row=i, column=2, padx=5)
@@ -1405,18 +1825,20 @@ def _launch_gui() -> None:
     af = ttk.LabelFrame(tab_emoji, text="API設定", padding=8)
     af.pack(fill="x", padx=10, pady=5)
 
-    e_api      = tk.StringVar(value="なし（従来通り）")
-    e_apikey   = tk.StringVar(value="")
-    e_baseurl  = tk.StringVar(value="")
-    e_model    = tk.StringVar(value="")
+    e_api = tk.StringVar(value="なし（従来通り）")
+    e_apikey = tk.StringVar(value="")
+    e_baseurl = tk.StringVar(value="")
+    e_model = tk.StringVar(value="")
     e_lm_model = tk.StringVar(value="")
 
     # API選択プルダウン
     api_label_to_key = API_PROVIDERS  # {"なし（従来通り）": "none", ...}
     api_combo = ttk.Combobox(
-        af, textvariable=e_api,
+        af,
+        textvariable=e_api,
         values=list(api_label_to_key.keys()),
-        state="readonly", width=30,
+        state="readonly",
+        width=30,
     )
     _row(af, "APIプロバイダー", api_combo, 0)
 
@@ -1425,12 +1847,12 @@ def _launch_gui() -> None:
     api_detail_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=3)
     af.columnconfigure(1, weight=1)
 
-    lbl_apikey  = tk.Label(api_detail_frame, text="APIキー", anchor="w")
-    ent_apikey  = tk.Entry(api_detail_frame, textvariable=e_apikey, width=40, show="*")
+    lbl_apikey = tk.Label(api_detail_frame, text="APIキー", anchor="w")
+    ent_apikey = tk.Entry(api_detail_frame, textvariable=e_apikey, width=40, show="*")
     lbl_baseurl = tk.Label(api_detail_frame, text="ベースURL（省略=自動）", anchor="w")
     ent_baseurl = tk.Entry(api_detail_frame, textvariable=e_baseurl, width=40)
-    lbl_model   = tk.Label(api_detail_frame, text="モデル名（省略=デフォルト）", anchor="w")
-    ent_model   = tk.Entry(api_detail_frame, textvariable=e_model, width=40)
+    lbl_model = tk.Label(api_detail_frame, text="モデル名（省略=デフォルト）", anchor="w")
+    ent_model = tk.Entry(api_detail_frame, textvariable=e_model, width=40)
 
     def _refresh_api_fields(*_):
         key = api_label_to_key.get(e_api.get(), "none")
@@ -1439,15 +1861,17 @@ def _launch_gui() -> None:
             w.grid_forget()
 
         if key == "none":
-            tk.Label(api_detail_frame,
-                     text="LLM処理なし：CSVのtextをcaptionにそのままコピーします",
-                     fg="gray").grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
+            tk.Label(
+                api_detail_frame,
+                text="LLM処理なし：CSVのtextをcaptionにそのままコピーします",
+                fg="gray",
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=5)
             return
 
         row = 0
         if key != "lm_studio":
-            lbl_apikey.grid( row=row, column=0, sticky="w", padx=5, pady=2)
-            ent_apikey.grid( row=row, column=1, sticky="ew", padx=5, pady=2)
+            lbl_apikey.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+            ent_apikey.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
             row += 1
 
         lbl_baseurl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
@@ -1473,6 +1897,7 @@ def _launch_gui() -> None:
 
     def _run_emoji():
         import threading
+
         api_key_str = api_label_to_key.get(e_api.get(), "none")
 
         if api_key_str == "none":
@@ -1496,22 +1921,31 @@ def _launch_gui() -> None:
                     writer.writeheader()
                     writer.writerows(rows)
                 e_log(f"完了: textをcaptionにコピーしました ({len(rows)}件) → {csv_path}")
+
             threading.Thread(target=task_none, daemon=True).start()
             return
 
         def task():
             emoji_caption(
-                Path(e_csv.get()), Path(e_wavdir.get()),
+                Path(e_csv.get()),
+                Path(e_wavdir.get()),
                 api_provider=api_key_str,
                 api_key=e_apikey.get(),
                 api_base_url=e_baseurl.get(),
                 model_name=e_model.get(),
                 log_fn=e_log,
             )
+
         threading.Thread(target=task, daemon=True).start()
 
-    tk.Button(tab_emoji, text="▶ 絵文字キャプション実行", command=_run_emoji,
-              bg="#FF5722", fg="white", font=("", 11, "bold")).pack(pady=8)
+    tk.Button(
+        tab_emoji,
+        text="▶ 絵文字キャプション実行",
+        command=_run_emoji,
+        bg="#FF5722",
+        fg="white",
+        font=("", 11, "bold"),
+    ).pack(pady=8)
 
     root.mainloop()
 
